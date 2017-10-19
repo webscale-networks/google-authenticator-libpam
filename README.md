@@ -170,6 +170,13 @@ entered by the user. In some situations, the administrator might prefer a
 different behavior. Pass the `echo_verification_code` option to the module
 in order to enable echoing.
 
+### revalidate=nnn
+
+Configure a number of seconds during which additional sessions are accepted for
+the same user and ip address without requesting an authentication token. For
+example, revalidate=86400 will only prompt a user for a token once per day as
+long as additional sessions are initiated from the same IP address.
+
 If you would like verification codes that are counter based instead of
 timebased, use the `google-authenticator` binary to generate a secret key in
 your home directory with the proper option.  In this mode, clock skew is
