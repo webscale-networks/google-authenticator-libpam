@@ -71,6 +71,13 @@ typedef struct Params {
   int        debug;
   int        no_strict_owner;
   int        allowed_perm;
+  /**
+   * Specifies a number of seconds to accept connections from
+   * the same IP address and user without asking for a token
+   * again. For example, revalidate = 86400 means a token is
+   * only requested once per day.
+   */
+  int        revalidate;
 } Params;
 
 static char oom;
@@ -1013,6 +1020,30 @@ static char *request_pass(pam_handle_t *pamh, int echocode,
   return ret;
 }
 
+
+/* Revalidates the access from the requesting host. Returns a non-zero
+ * value to indicate that revalidation was successful and that the
+ * previous token is valid.
+ */
+int revalidate(pam_handle_t* pamh, const char* config, const char* username) {
+  char* host;
+  if (pam_get_item(pamh, PAM_RHOST, (const void **)&host) == PAM_SUCCESS) {
+    char revalidate_key[100];
+    snprintf(revalidate_key, sizeof(revalidate_key), "REVALIDATE_%s", host);
+    const char *value = get_cfg_value(pamh, revalidate_key, config);
+    if (value) {
+      time_t revalidate = strtoul(value, 0, 10);
+      if (get_time() < revalidate) {
+        log_message(LOG_INFO, pamh,
+          "Accepting previous token validation for %s at %s",
+           username, host);
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* Checks for possible use of scratch codes. Returns -1 on error, 0 on success,
  * and 1, if no scratch code had been entered, and subsequent tests should be
  * applied.
@@ -1574,6 +1605,17 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
     } else if (!strcmp(argv[i], "echo-verification-code") ||
                !strcmp(argv[i], "echo_verification_code")) {
       params->echocode = PAM_PROMPT_ECHO_ON;
+    } else if (!strncmp(argv[i], "revalidate=", 11)) {
+      char *remainder = NULL;
+      const long revalidate = strtol(argv[i] + 11, &remainder, 10);
+      if (*remainder || revalidate < 0 || revalidate > INT_MAX) {
+        log_message(LOG_ERR, pamh,
+                    "Invalid setting revalidate=\"%s\"."
+                    " Must be a non-negative integer.",
+                    argv[i]);
+        return -1;
+      }
+      params->revalidate = (int)revalidate;
     } else {
       log_message(LOG_ERR, pamh, "Unrecognized option \"%s\"", argv[i]);
       return -1;
@@ -1609,6 +1651,9 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   char* const secret_filename = get_secret_filename(pamh, &params,
                                                     username, &uid);
   int stopped_by_rate_limit = 0;
+  // When 1, indicates that the current request succeded by revalidating
+  // previous token entry.
+  int revalidated = 0;
 
   // Drop privileges.
   {
@@ -1682,6 +1727,12 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
         if (params.pass_mode == USE_FIRST_PASS ||
             params.pass_mode == TRY_FIRST_PASS) {
           pw = get_first_pass(pamh);
+        }
+        // If we can revalidate a previous token, then go straight to success.
+        if (!pw && revalidate(pamh, buf, username)) {
+          rc = PAM_SUCCESS;
+          revalidated = 1;
+          goto success;
         }
         break;
       default:
@@ -1829,7 +1880,19 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     }
 
     // Display a success or error message
+  success:
     if (rc == PAM_SUCCESS) {
+      if (!revalidated) {
+        char* host;
+        if (params.revalidate && pam_get_item(pamh, PAM_RHOST, (const void **)&host) == PAM_SUCCESS) {
+          char revalidate_key[100], revalidate_val[40];
+          snprintf(revalidate_key, sizeof(revalidate_key), "REVALIDATE_%s", host);
+          snprintf(revalidate_val, sizeof(revalidate_val), "%ld", get_time() + params.revalidate);
+          if (set_cfg_value(pamh, revalidate_key, revalidate_val, &buf) < 0) {
+            rc = PAM_AUTH_ERR;
+          }
+        }
+      }
       log_message(LOG_INFO , pamh, "Accepted google_authenticator for %s", username);
     } else {
       log_message(LOG_ERR, pamh, "Invalid verification code for %s", username);
