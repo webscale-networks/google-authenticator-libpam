@@ -51,6 +51,7 @@
 #include "base32.h"
 #include "hmac.h"
 #include "sha1.h"
+#include "util.h"
 
 #define MODULE_NAME   "pam_google_authenticator"
 #define SECRET        "~/.google_authenticator"
@@ -461,23 +462,28 @@ static int open_secret_file(pam_handle_t *pamh, const char *secret_filename,
   return fd;
 }
 
+// Read secret file contents.
+// If there's an error the file is closed, NULL is returned, and errno set.
 static char *read_file_contents(pam_handle_t *pamh,
                                 const Params *params,
                                 const char *secret_filename, int *fd,
                                 off_t filesize) {
+  // Arbitrary limit to prevent integer overflow.
+  if (filesize > 1000000) {
+    errno = E2BIG;
+    return NULL;
+  }
+
   // Read file contents
   char *buf = malloc(filesize + 1);
-  if (!buf ||
-      read(*fd, buf, filesize) != filesize) {
-    close(*fd);
-    *fd = -1;
+  if (!buf) {
+    log_message(LOG_ERR, pamh, "Failed to malloc %d+1", filesize);
+    goto out;
+  }
+
+  if (filesize != read(*fd, buf, filesize)) {
     log_message(LOG_ERR, pamh, "Could not read \"%s\"", secret_filename);
- error:
-    if (buf) {
-      memset(buf, 0, filesize);
-      free(buf);
-    }
-    return NULL;
+    goto out;
   }
   close(*fd);
   *fd = -1;
@@ -486,7 +492,7 @@ static char *read_file_contents(pam_handle_t *pamh,
   if (memchr(buf, 0, filesize)) {
     log_message(LOG_ERR, pamh, "Invalid file contents in \"%s\"",
                 secret_filename);
-    goto error;
+    goto out;
   }
 
   // Terminate the buffer with a NUL byte.
@@ -496,6 +502,18 @@ static char *read_file_contents(pam_handle_t *pamh,
     log_message(LOG_INFO, pamh, "debug: \"%s\" read", secret_filename);
   }
   return buf;
+
+out:
+  // If we have any data, erase it.
+  if (buf) {
+    explicit_bzero(buf, filesize);
+  }
+  free(buf);
+  if (*fd >= 0) {
+    close(*fd);
+    *fd = -1;
+  }
+  return NULL;
 }
 
 static int is_totp(const char *buf) {
@@ -537,7 +555,7 @@ static int write_file_contents(pam_handle_t *pamh,
                                const char *buf) {
   int err = 0;
   int fd = -1;
-  const size_t fnlength = strlen(secret_filename) + 2;
+  const size_t fnlength = strlen(secret_filename) + 1 + 6 + 1;
 
   char *tmp_filename = malloc(fnlength);
   if (tmp_filename == NULL) {
@@ -545,14 +563,23 @@ static int write_file_contents(pam_handle_t *pamh,
     goto cleanup;
   }
 
-  if (snprintf(tmp_filename, fnlength,
-               "%s~", secret_filename) != fnlength - 1) {
+  if (fnlength - 1 != snprintf(tmp_filename, fnlength,
+                               "%s~XXXXXX", secret_filename)) {
     err = ERANGE;
     goto cleanup;
   }
-
-  fd = open(tmp_filename,  O_WRONLY|O_CREAT|O_NOFOLLOW|O_TRUNC|O_EXCL, 0400);
+  fd = mkstemp(tmp_filename);
   if (fd < 0) {
+    err = errno;
+    log_message(LOG_ERR, pamh, "Failed to create tempfile \"%s\": %s",
+                tmp_filename, strerror(err));
+
+    // Couldn't open file; don't try to delete it later.
+    free(tmp_filename);
+    tmp_filename = NULL;
+    goto cleanup;
+  }
+  if (fchmod(fd, 0400)) {
     err = errno;
     goto cleanup;
   }
@@ -560,6 +587,9 @@ static int write_file_contents(pam_handle_t *pamh,
   // Make sure the secret file is still the same. This prevents attackers
   // from opening a lot of pending sessions and then reusing the same
   // scratch code multiple times.
+  //
+  // (except for the brief race condition between this stat and the
+  // `rename` below)
   {
     struct stat sb;
     if (stat(secret_filename, &sb) != 0) {
@@ -596,7 +626,7 @@ static int write_file_contents(pam_handle_t *pamh,
     goto cleanup;
   }
   free(tmp_filename);
-  tmp_filename = NULL; // Prevent unlink.
+  tmp_filename = NULL; // Prevent unlink & double-free.
 
   if (params->debug) {
     log_message(LOG_INFO, pamh, "debug: \"%s\" written", secret_filename);
@@ -607,7 +637,10 @@ cleanup:
     close(fd);
   }
   if (tmp_filename) {
-    unlink(tmp_filename);
+    if (unlink(tmp_filename)) {
+      log_message(LOG_ERR, pamh, "Failed to delete tempfile \"%s\": %s",
+                  tmp_filename, strerror(errno));
+    }
   }
   free(tmp_filename);
 
@@ -619,6 +652,10 @@ cleanup:
   return 0;
 }
 
+// given secret file content (buf), extract the secret and base32 decode it.
+//
+// Return pointer to `malloc()`'d secret on success (caller frees),
+// NULL on error. Length of secret stored in *secretLen.
 static uint8_t *get_shared_secret(pam_handle_t *pamh,
                                   const Params *params,
                                   const char *secret_filename,
@@ -628,6 +665,12 @@ static uint8_t *get_shared_secret(pam_handle_t *pamh,
   }
   // Decode secret key
   const int base32Len = strcspn(buf, "\n");
+
+  // Arbitrary limit to prevent integer overflow.
+  if (base32Len > 100000) {
+    return NULL;
+  }
+
   *secretLen = (base32Len*5 + 7)/8;
   uint8_t *secret = malloc(base32Len + 1);
   if (secret == NULL) {
@@ -640,7 +683,7 @@ static uint8_t *get_shared_secret(pam_handle_t *pamh,
     log_message(LOG_ERR, pamh,
                 "Could not find a valid BASE32 encoded secret in \"%s\"",
                 secret_filename);
-    memset(secret, 0, base32Len);
+    explicit_bzero(secret, base32Len);
     free(secret);
     return NULL;
   }
@@ -677,7 +720,7 @@ static char *get_cfg_value(pam_handle_t *pamh, const char *key,
   const size_t key_len = strlen(key);
   for (const char *line = buf; *line; ) {
     const char *ptr;
-    if (line[0] == '"' && line[1] == ' ' && !memcmp(line+2, key, key_len) &&
+    if (line[0] == '"' && line[1] == ' ' && !strncmp(line+2, key, key_len) &&
         (!*(ptr = line+2+key_len) || *ptr == ' ' || *ptr == '\t' ||
          *ptr == '\r' || *ptr == '\n')) {
       ptr += strspn(ptr, " \t");
@@ -708,7 +751,7 @@ static int set_cfg_value(pam_handle_t *pamh, const char *key, const char *val,
   // Find an existing line, if any.
   for (char *line = *buf; *line; ) {
     char *ptr;
-    if (line[0] == '"' && line[1] == ' ' && !memcmp(line+2, key, key_len) &&
+    if (line[0] == '"' && line[1] == ' ' && !strncmp(line+2, key, key_len) &&
         (!*(ptr = line+2+key_len) || *ptr == ' ' || *ptr == '\t' ||
          *ptr == '\r' || *ptr == '\n')) {
       start = line;
@@ -766,7 +809,7 @@ static int set_cfg_value(pam_handle_t *pamh, const char *key, const char *val,
   // Check if there are any other occurrences of "value". If so, delete them.
   for (char *line = start + 4 + key_len + val_len; *line; ) {
     char *ptr;
-    if (line[0] == '"' && line[1] == ' ' && !memcmp(line+2, key, key_len) &&
+    if (line[0] == '"' && line[1] == ' ' && !strncmp(line+2, key, key_len) &&
         (!*(ptr = line+2+key_len) || *ptr == ' ' || *ptr == '\t' ||
          *ptr == '\r' || *ptr == '\n')) {
       start = line;
@@ -1259,14 +1302,14 @@ int compute_code(const uint8_t *secret, int secretLen, unsigned long value) {
   }
   uint8_t hash[SHA1_DIGEST_LENGTH];
   hmac_sha1(secret, secretLen, val, 8, hash, SHA1_DIGEST_LENGTH);
-  memset(val, 0, sizeof(val));
+  explicit_bzero(val, sizeof(val));
   const int offset = hash[SHA1_DIGEST_LENGTH - 1] & 0xF;
   unsigned int truncatedHash = 0;
   for (int i = 0; i < 4; ++i) {
     truncatedHash <<= 8;
     truncatedHash  |= hash[offset + i];
   }
-  memset(hash, 0, sizeof(hash));
+  explicit_bzero(hash, sizeof(hash));
   truncatedHash &= 0x7FFFFFFF;
   truncatedHash %= 1000000;
   return truncatedHash;
@@ -1275,7 +1318,7 @@ int compute_code(const uint8_t *secret, int secretLen, unsigned long value) {
 /* If a user repeated attempts to log in with the same time skew, remember
  * this skew factor for future login attempts.
  */
-static int check_time_skew(pam_handle_t *pamh, const char *secret_filename,
+static int check_time_skew(pam_handle_t *pamh,
                            int *updated, char **buf, int skew, int tm) {
   int rc = -1;
 
@@ -1474,7 +1517,7 @@ static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
       if(params->debug) {
         log_message(LOG_INFO, pamh, "debug: time skew adjusted");
       }
-      return check_time_skew(pamh, secret_filename, updated, buf, skew, tm);
+      return check_time_skew(pamh, updated, buf, skew, tm);
     }
   }
 
@@ -1488,7 +1531,7 @@ static int check_timebased_code(pam_handle_t *pamh, const char*secret_filename,
 static int check_counterbased_code(pam_handle_t *pamh,
                                    const char*secret_filename, int *updated,
                                    char **buf, const uint8_t*secret,
-                                   int secretLen, int code, Params *params,
+                                   int secretLen, int code,
                                    long hotp_counter,
                                    int *must_advance_counter) {
   if (hotp_counter < 1) {
@@ -1564,18 +1607,18 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
   params->debug = 0;
   params->echocode = PAM_PROMPT_ECHO_OFF;
   for (int i = 0; i < argc; ++i) {
-    if (!memcmp(argv[i], "secret=", 7)) {
+    if (!strncmp(argv[i], "secret=", 7)) {
       params->secret_filename_spec = argv[i] + 7;
-    } else if (!memcmp(argv[i], "authtok_prompt=", 15)) {
+    } else if (!strncmp(argv[i], "authtok_prompt=", 15)) {
       params->authtok_prompt = argv[i] + 15;
-    } else if (!memcmp(argv[i], "user=", 5)) {
+    } else if (!strncmp(argv[i], "user=", 5)) {
       uid_t uid;
       if (parse_user(pamh, argv[i] + 5, &uid) < 0) {
         return -1;
       }
       params->fixed_uid = 1;
       params->uid = uid;
-    } else if (!memcmp(argv[i], "allowed_perm=", 13)) {
+    } else if (!strncmp(argv[i], "allowed_perm=", 13)) {
       char *remainder = NULL;
       const int perm = (int)strtol(argv[i] + 13, &remainder, 8);
       if (perm == 0 || strlen(remainder) != 0) {
@@ -1624,7 +1667,7 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
   return 0;
 }
 
-static int google_authenticator(pam_handle_t *pamh, int flags,
+static int google_authenticator(pam_handle_t *pamh,
                                 int argc, const char **argv) {
   int        rc = PAM_AUTH_ERR;
   int        uid = -1, old_uid = -1, old_gid = -1, fd = -1;
@@ -1694,7 +1737,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   // Only if nullok and we do not have a code will we NOT ask for a code.
   // In all other cases (i.e "have code" and "no nullok and no code") we DO ask for a code.
   if (!stopped_by_rate_limit &&
-        ( secret || (!secret && params.nullok != SECRETNOTFOUND ) )
+        ( secret || params.nullok != SECRETNOTFOUND )
      ) {
 
     if (!secret) {
@@ -1714,7 +1757,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
         // code. This error should never trigger. The unittest checks for
         // this.
         if (pw) {
-          memset(pw, 0, strlen(pw));
+          explicit_bzero(pw, strlen(pw));
           free(pw);
           pw = NULL;
         }
@@ -1782,7 +1825,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
           (ch = pw[pw_len - expected_len]) > '9' ||
           ch < (expected_len == 8 ? '1' : '0')) {
       invalid:
-        memset(pw, 0, pw_len);
+        explicit_bzero(pw, pw_len);
         free(pw);
         pw = NULL;
         continue;
@@ -1815,7 +1858,7 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
           if (hotp_counter > 0) {
             switch (check_counterbased_code(pamh, secret_filename, &updated,
                                             &buf, secret, secretLen, code,
-                                            &params, hotp_counter,
+                                            hotp_counter,
                                             &must_advance_counter)) {
             case 0:
               rc = PAM_SUCCESS;
@@ -1860,11 +1903,11 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
 
     // Clear out password and deallocate memory
     if (pw) {
-      memset(pw, 0, strlen(pw));
+      explicit_bzero(pw,strlen(pw));
       free(pw);
     }
     if (saved_pw) {
-      memset(saved_pw, 0, strlen(saved_pw));
+      explicit_bzero(saved_pw, strlen(saved_pw));
       free(saved_pw);
     }
 
@@ -1916,15 +1959,15 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
     if ((err = write_file_contents(pamh, &params, secret_filename, &orig_stat, buf))) {
       // Inform user of error if the error is clearly a system error
       // and not an auth error.
-      char buf[1024];
+      char s[1024];
       switch (err) {
       case EPERM:
       case ENOSPC:
       case EROFS:
       case EIO:
       case EDQUOT:
-        snprintf(buf, sizeof(buf), "Error \"%s\" while writing config", strerror(err));
-        conv_error(pamh, buf);
+        snprintf(s, sizeof(s), "Error \"%s\" while writing config", strerror(err));
+        conv_error(pamh, s);
       }
       // Could not persist new state. Deny access.
       rc = PAM_AUTH_ERR;
@@ -1932,6 +1975,11 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   }
 
 out:
+  if (params.debug) {
+    log_message(LOG_INFO, pamh,
+                "debug: end of google_authenticator for \"%s\". Result: %s",
+                username, pam_strerror(pamh, rc));
+  }
   if (fd >= 0) {
     close(fd);
   }
@@ -1950,23 +1998,34 @@ out:
 
   // Clean up
   if (buf) {
-    memset(buf, 0, strlen(buf));
+    explicit_bzero(buf, strlen(buf));
     free(buf);
   }
   if (secret) {
-    memset(secret, 0, secretLen);
+    explicit_bzero(secret, secretLen);
     free(secret);
   }
   return rc;
 }
 
-PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
+#ifndef UNUSED_ATTR
+# if __GNUC__ >= 3 || (__GNUC__ == 2 && __GNUC_MINOR__ >= 7)
+#  define UNUSED_ATTR __attribute__((__unused__))
+# else
+#  define UNUSED_ATTR
+# endif
+#endif
+
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags UNUSED_ATTR,
                                    int argc, const char **argv) {
-  return google_authenticator(pamh, flags, argc, argv);
+  return google_authenticator(pamh, argc, argv);
 }
 
-PAM_EXTERN int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc,
-                              const char **argv) {
+PAM_EXTERN int
+pam_sm_setcred (pam_handle_t *pamh UNUSED_ATTR,
+                int flags UNUSED_ATTR,
+                int argc UNUSED_ATTR,
+                const char **argv UNUSED_ATTR) {
   return PAM_SUCCESS;
 }
 
